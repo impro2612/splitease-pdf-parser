@@ -159,6 +159,48 @@ def detect_word_columns(rows: list, page_w: float) -> tuple[Optional[int], dict]
     }
 
 
+def extract_row_narration(row: list, spec: dict) -> str:
+    """
+    Extract narration from a dated transaction row.
+
+    Primary strategy uses the detected narration bounds. For statements where
+    the first narration token is very short (e.g. "UPI-CRED", "UPI-FLIPKART",
+    "ACHD-"), the token can sit too close to the date column and fall outside
+    the narration bounds. In that case, fall back to collecting non-date,
+    non-amount, non-reference words that live between the date and amount
+    columns.
+    """
+    def mid(w) -> float:
+        return (w["x0"] + w["x1"]) / 2
+
+    _, d_hi = spec["date_bounds"]
+    n_lo, n_hi = spec["narr_bounds"]
+    db_lo, _ = spec["debit_bounds"]
+
+    narr_words = [w["text"] for w in row if n_lo <= mid(w) <= n_hi]
+    narr_text = " ".join(narr_words).strip()
+    if narr_text:
+        return narr_text
+
+    fallback_words: list[str] = []
+    for w in row:
+        text = w["text"].strip()
+        cx = mid(w)
+        if not text:
+            continue
+        if cx >= db_lo:
+            continue
+        if parse_date(text):
+            continue
+        if looks_like_amount(text):
+            continue
+        if re.fullmatch(r"\d{8,}", re.sub(r"\D", "", text)):
+            continue
+        fallback_words.append(text)
+
+    return " ".join(fallback_words).strip()
+
+
 def extract_by_words(page, prev_spec: Optional[dict] = None) -> tuple[list, dict]:
     """
     Extract transactions using word x/y coordinates.
@@ -215,7 +257,7 @@ def extract_by_words(page, prev_spec: Optional[dict] = None) -> tuple[list, dict
         row_top = row[0]["top"] if row else None
         date_text = " ".join(w["text"] for w in row if d_lo <= mid(w) <= d_hi)
         date_str = parse_date(date_text)
-        narr_text = " ".join(w["text"] for w in row if n_lo <= mid(w) <= n_hi).strip()
+        narr_text = extract_row_narration(row, spec)
 
         if not date_str:
             gap = (row_top - prev_top) if (row_top is not None and prev_top is not None) else 0
