@@ -4,7 +4,7 @@ import re
 from typing import Optional
 
 import pdfplumber
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -23,10 +23,14 @@ class ParseRequest(BaseModel):
     password: Optional[str] = None
 
 
-def parse_amount(text) -> float:
+# Matches Indian bank amounts: digits with optional commas and one decimal part
+_AMOUNT_RE = re.compile(r"^\d[\d,]*\.?\d*$")
+
+
+def parse_amount(text: str) -> float:
     if not text:
         return 0.0
-    cleaned = re.sub(r"[^\d.]", "", str(text).replace(",", ""))
+    cleaned = re.sub(r"[^\d.]", "", text.replace(",", ""))
     if not cleaned:
         return 0.0
     try:
@@ -36,10 +40,16 @@ def parse_amount(text) -> float:
         return 0.0
 
 
-def parse_date(text) -> str:
+def looks_like_amount(text: str) -> bool:
+    """True only for words that look like monetary amounts (e.g. '2,554.79')."""
+    t = text.strip()
+    return bool(_AMOUNT_RE.match(t)) and ("," in t or "." in t)
+
+
+def parse_date(text: str) -> str:
     if not text:
         return ""
-    m = re.search(r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})", str(text).strip())
+    m = re.search(r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})", text.strip())
     if not m:
         return ""
     d, mo, y = m.group(1), m.group(2), m.group(3)
@@ -52,8 +62,156 @@ def parse_date(text) -> str:
     return f"{year}-{mo.zfill(2)}-{d.zfill(2)}"
 
 
+def group_words_into_rows(words: list, y_tol: float = 4) -> list:
+    """Group pdfplumber word dicts by their vertical (top) position."""
+    if not words:
+        return []
+    sorted_w = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    rows = []
+    cur = [sorted_w[0]]
+    cur_top: float = sorted_w[0]["top"]
+    for w in sorted_w[1:]:
+        if abs(w["top"] - cur_top) <= y_tol:
+            cur.append(w)
+        else:
+            rows.append(sorted(cur, key=lambda x: x["x0"]))
+            cur = [w]
+            cur_top = w["top"]
+    rows.append(sorted(cur, key=lambda x: x["x0"]))
+    return rows
+
+
+def _classify_header_word(text: str) -> str:
+    """Map a header cell text to a column role."""
+    t = text.lower().strip(".")
+    if "date" in t and "value" not in t:
+        return "date"
+    if any(k in t for k in ["narration", "description", "particulars"]):
+        return "narr"
+    if any(k in t for k in ["withdrawal", "debit", "dr"]):
+        return "debit"
+    if any(k in t for k in ["deposit", "credit", "cr"]):
+        return "credit"
+    return "other"
+
+
+def extract_by_words(page) -> list:
+    """
+    Extract transactions using word x/y coordinates.
+
+    Handles bank PDFs (e.g. HDFC) where the outer table border has no internal
+    row lines, causing pdfplumber's table extractor to merge all transactions on
+    a page into a single multi-value cell.  We instead group words by their
+    y-position and assign them to columns by x-position.
+    """
+    words = page.extract_words(x_tolerance=5, y_tolerance=3)
+    if not words:
+        return []
+
+    rows = group_words_into_rows(words)
+    page_w = float(page.width)
+
+    # ── Locate the header row ──────────────────────────────────────────────
+    header_idx = None
+    # (cx, role) for ALL detected header columns, sorted left→right
+    all_cols: list = []
+    role_cx: dict = {}
+
+    for i, row in enumerate(rows):
+        joined = " ".join(w["text"].lower() for w in row)
+        if not (("withdrawal" in joined or "debit" in joined) and
+                ("deposit" in joined or "credit" in joined)):
+            continue
+        header_idx = i
+        for w in row:
+            role = _classify_header_word(w["text"])
+            cx = (w["x0"] + w["x1"]) / 2
+            all_cols.append((cx, role))
+            if role != "other":
+                role_cx.setdefault(role, cx)
+        all_cols.sort(key=lambda x: x[0])
+        break
+
+    if header_idx is None:
+        return []
+
+    # Fill in HDFC defaults for any role that wasn't detected
+    _defaults = {"date": 60.0, "narr": 230.0, "debit": 415.0, "credit": 495.0}
+    for role, default_cx in _defaults.items():
+        if role not in role_cx:
+            role_cx[role] = default_cx
+            all_cols.append((default_cx, role))
+    all_cols.sort(key=lambda x: x[0])
+
+    # ── Compute tight column x-boundaries using ALL detected columns ───────
+    def bounds_for_cx(target_cx: float):
+        for i, (v, _) in enumerate(all_cols):
+            if abs(v - target_cx) < 1.0:
+                lo = (all_cols[i - 1][0] + target_cx) / 2 if i > 0 else 0.0
+                hi = (target_cx + all_cols[i + 1][0]) / 2 if i < len(all_cols) - 1 else page_w
+                return lo, hi
+        return 0.0, page_w
+
+    d_lo,  d_hi  = bounds_for_cx(role_cx["date"])
+    n_lo,  n_hi  = bounds_for_cx(role_cx["narr"])
+    db_lo, db_hi = bounds_for_cx(role_cx["debit"])
+    cr_lo, cr_hi = bounds_for_cx(role_cx["credit"])
+
+    def mid(w) -> float:
+        return (w["x0"] + w["x1"]) / 2
+
+    def best_amount(row_words, lo, hi, col_cx_val) -> float:
+        """Return the amount from the word in [lo, hi] that looks most like a number."""
+        candidates = [w for w in row_words if lo <= mid(w) <= hi and looks_like_amount(w["text"])]
+        if not candidates:
+            return 0.0
+        # Prefer the word whose centre is closest to the column header centre
+        best = min(candidates, key=lambda w: abs(mid(w) - col_cx_val))
+        return parse_amount(best["text"])
+
+    # ── Extract transaction rows ───────────────────────────────────────────
+    transactions = []
+    for row in rows[header_idx + 1:]:
+        date_text = " ".join(w["text"] for w in row if d_lo <= mid(w) <= d_hi)
+        date_str  = parse_date(date_text)
+        if not date_str:
+            continue
+
+        narr_text = " ".join(w["text"] for w in row if n_lo <= mid(w) <= n_hi).strip()
+        if not narr_text:
+            continue
+
+        debit  = best_amount(row, db_lo, db_hi, role_cx["debit"])
+        credit = best_amount(row, cr_lo, cr_hi, role_cx["credit"])
+
+        if debit <= 0 and credit <= 0:
+            continue
+        if debit > 0 and credit > 0:
+            continue
+
+        transactions.append({
+            "date":        date_str,
+            "description": narr_text,
+            "amount":      round(debit if debit > 0 else credit, 2),
+            "type":        "debit" if debit > 0 else "credit",
+        })
+
+    return transactions
+
+
+# ── Existing table-based extraction (kept for banks that do have row lines) ─
+
+def is_header_row(row: list) -> bool:
+    text = " ".join(str(c or "") for c in row).lower()
+    return (
+        ("withdrawal" in text or "debit" in text)
+        and ("deposit" in text or "credit" in text)
+        and ("date" in text or "narration" in text)
+    )
+
+
 def find_column_indices(header_row: list) -> dict:
-    cols = {}
+    cols: dict = {}
     for i, cell in enumerate(header_row or []):
         text = str(cell or "").lower().strip()
         if "date" not in cols and "date" in text and "value" not in text:
@@ -67,20 +225,11 @@ def find_column_indices(header_row: list) -> dict:
     return cols
 
 
-def is_header_row(row: list) -> bool:
-    text = " ".join(str(c or "") for c in row).lower()
-    return (
-        ("withdrawal" in text or "debit" in text)
-        and ("deposit" in text or "credit" in text)
-        and ("date" in text or "narration" in text)
-    )
-
-
 def extract_from_table(table: list) -> list:
     if not table:
         return []
 
-    col_idx = {}
+    col_idx: dict = {}
     start_row = 0
     for i, row in enumerate(table):
         if row and is_header_row(row):
@@ -88,7 +237,6 @@ def extract_from_table(table: list) -> list:
             start_row = i + 1
             break
 
-    # Fallback: HDFC layout Date|Narration|Ref|ValueDt|Withdrawal|Deposit|Balance
     if not col_idx:
         col_idx = {"date": 0, "narration": 1, "withdrawal": 4, "deposit": 5}
 
@@ -98,19 +246,17 @@ def extract_from_table(table: list) -> list:
     dep_col  = col_idx.get("deposit", 5)
 
     transactions = []
-
     for row in table[start_row:]:
         if not row:
             continue
 
-        date_cell = str(row[date_col] if date_col < len(row) else "")
-        date_str  = parse_date(date_cell)
+        date_str = parse_date(str(row[date_col] if date_col < len(row) else ""))
         if not date_str:
             continue
 
         narration  = str(row[narr_col] if narr_col < len(row) else "").replace("\n", " ").strip()
-        withdrawal = parse_amount(row[wdl_col] if wdl_col < len(row) else None)
-        deposit    = parse_amount(row[dep_col] if dep_col < len(row) else None)
+        withdrawal = parse_amount(str(row[wdl_col] if wdl_col < len(row) else ""))
+        deposit    = parse_amount(str(row[dep_col] if dep_col < len(row) else ""))
 
         if withdrawal <= 0 and deposit <= 0:
             continue
@@ -131,31 +277,39 @@ def extract_from_table(table: list) -> list:
 
 def extract_transactions(content: bytes, password: Optional[str]) -> list:
     open_kwargs = {"password": password} if password else {}
-    transactions = []
+    all_transactions: list = []
 
     with pdfplumber.open(io.BytesIO(content), **open_kwargs) as pdf:
         for page in pdf.pages:
-            # Try line-based table extraction first
-            tables = page.extract_tables({
+            # Strategy 1: line-based table extraction
+            line_tables = page.extract_tables({
                 "vertical_strategy":   "lines",
                 "horizontal_strategy": "lines",
             })
-            if tables:
-                for table in tables:
-                    transactions.extend(extract_from_table(table))
-            else:
-                # Fallback: text-based table extraction
-                tables = page.extract_tables({
+            table_txns: list = []
+            for table in (line_tables or []):
+                table_txns.extend(extract_from_table(table))
+
+            # Strategy 2: word-coordinate extraction — handles HDFC-style merged rows
+            # Always run; use whichever strategy yields more transactions
+            word_txns = extract_by_words(page)
+            page_txns = word_txns if len(word_txns) > len(table_txns) else table_txns
+
+            # Strategy 3: text-based table extraction as last resort
+            if not page_txns:
+                text_tables = page.extract_tables({
                     "vertical_strategy":   "text",
                     "horizontal_strategy": "text",
                 })
-                for table in (tables or []):
-                    transactions.extend(extract_from_table(table))
+                for table in (text_tables or []):
+                    page_txns.extend(extract_from_table(table))
 
-    # Deduplicate
-    seen = set()
+            all_transactions.extend(page_txns)
+
+    # Deduplicate while preserving order
+    seen: set = set()
     unique = []
-    for t in transactions:
+    for t in all_transactions:
         key = f"{t['date']}|{t['amount']}|{t['type']}|{t['description'][:40]}"
         if key not in seen:
             seen.add(key)
