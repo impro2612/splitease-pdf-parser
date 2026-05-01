@@ -25,6 +25,11 @@ class ParseRequest(BaseModel):
 
 # Matches Indian bank amounts: digits with optional commas and one decimal part
 _AMOUNT_RE = re.compile(r"^\d[\d,]*\.?\d*$")
+_FOOTER_RE = re.compile(
+    r"(statementsummary|openingbalance|generatedon|hdfcbanklimited|closingbalanceincludes|"
+    r"registeredofficeaddress|contentsofthisstatement|gstn|drcount|crcount)",
+    re.IGNORECASE,
+)
 
 
 def parse_amount(text: str) -> float:
@@ -95,32 +100,18 @@ def _classify_header_word(text: str) -> str:
     return "other"
 
 
-def extract_by_words(page) -> list:
-    """
-    Extract transactions using word x/y coordinates.
-
-    Handles bank PDFs (e.g. HDFC) where the outer table border has no internal
-    row lines, causing pdfplumber's table extractor to merge all transactions on
-    a page into a single multi-value cell.  We instead group words by their
-    y-position and assign them to columns by x-position.
-    """
-    words = page.extract_words(x_tolerance=5, y_tolerance=3)
-    if not words:
-        return []
-
-    rows = group_words_into_rows(words)
-    page_w = float(page.width)
-
-    # ── Locate the header row ──────────────────────────────────────────────
+def detect_word_columns(rows: list, page_w: float) -> tuple[Optional[int], dict]:
+    """Detect header columns from grouped word rows and build reusable bounds."""
     header_idx = None
-    # (cx, role) for ALL detected header columns, sorted left→right
     all_cols: list = []
     role_cx: dict = {}
 
     for i, row in enumerate(rows):
         joined = " ".join(w["text"].lower() for w in row)
         if not (("withdrawal" in joined or "debit" in joined) and
-                ("deposit" in joined or "credit" in joined)):
+                ("deposit" in joined or "credit" in joined) and
+                "date" in joined and
+                "narration" in joined):
             continue
         header_idx = i
         for w in row:
@@ -133,17 +124,16 @@ def extract_by_words(page) -> list:
         break
 
     if header_idx is None:
-        return []
+        return None, {}
 
     # Fill in HDFC defaults for any role that wasn't detected
-    _defaults = {"date": 60.0, "narr": 230.0, "debit": 415.0, "credit": 495.0}
-    for role, default_cx in _defaults.items():
+    defaults = {"date": 60.0, "narr": 230.0, "debit": 415.0, "credit": 495.0}
+    for role, default_cx in defaults.items():
         if role not in role_cx:
             role_cx[role] = default_cx
             all_cols.append((default_cx, role))
     all_cols.sort(key=lambda x: x[0])
 
-    # ── Compute tight column x-boundaries using ALL detected columns ───────
     def bounds_for_cx(target_cx: float):
         for i, (v, _) in enumerate(all_cols):
             if abs(v - target_cx) < 1.0:
@@ -157,6 +147,38 @@ def extract_by_words(page) -> list:
     db_lo, db_hi = bounds_for_cx(role_cx["debit"])
     cr_lo, cr_hi = bounds_for_cx(role_cx["credit"])
 
+    return header_idx, {
+        "date_cx": role_cx["date"],
+        "narr_cx": role_cx["narr"],
+        "debit_cx": role_cx["debit"],
+        "credit_cx": role_cx["credit"],
+        "date_bounds": (d_lo, d_hi),
+        "narr_bounds": (n_lo, n_hi),
+        "debit_bounds": (db_lo, db_hi),
+        "credit_bounds": (cr_lo, cr_hi),
+    }
+
+
+def extract_by_words(page, prev_spec: Optional[dict] = None) -> tuple[list, dict]:
+    """
+    Extract transactions using word x/y coordinates.
+
+    Handles bank PDFs (e.g. HDFC) where the outer table border has no internal
+    row lines, causing pdfplumber's table extractor to merge all transactions on
+    a page into a single multi-value cell.  We instead group words by their
+    y-position and assign them to columns by x-position.
+    """
+    words = page.extract_words(x_tolerance=5, y_tolerance=3)
+    if not words:
+        return [], prev_spec or {}
+
+    rows = group_words_into_rows(words)
+    page_w = float(page.width)
+    header_idx, detected_spec = detect_word_columns(rows, page_w)
+    spec = detected_spec or prev_spec or {}
+    if not spec:
+        return [], {}
+
     def mid(w) -> float:
         return (w["x0"] + w["x1"]) / 2
 
@@ -169,34 +191,74 @@ def extract_by_words(page) -> list:
         best = min(candidates, key=lambda w: abs(mid(w) - col_cx_val))
         return parse_amount(best["text"])
 
-    # ── Extract transaction rows ───────────────────────────────────────────
+    d_lo, d_hi = spec["date_bounds"]
+    n_lo, n_hi = spec["narr_bounds"]
+    db_lo, db_hi = spec["debit_bounds"]
+    cr_lo, cr_hi = spec["credit_bounds"]
+
+    # Start after header row if present; otherwise skip the repeated account
+    # summary area and wait for the first actual dated row.
+    start_idx = header_idx + 1 if header_idx is not None else 0
+
     transactions = []
-    for row in rows[header_idx + 1:]:
+    current: Optional[dict] = None
+
+    def flush_current():
+        nonlocal current
+        if current and current.get("date") and current.get("description") and current.get("amount", 0) > 0:
+            current["description"] = re.sub(r"\s+", " ", current["description"]).strip()
+            transactions.append(current)
+        current = None
+
+    prev_top: Optional[float] = None
+    for row in rows[start_idx:]:
+        row_top = row[0]["top"] if row else None
         date_text = " ".join(w["text"] for w in row if d_lo <= mid(w) <= d_hi)
-        date_str  = parse_date(date_text)
+        date_str = parse_date(date_text)
+        narr_text = " ".join(w["text"] for w in row if n_lo <= mid(w) <= n_hi).strip()
+
         if not date_str:
+            gap = (row_top - prev_top) if (row_top is not None and prev_top is not None) else 0
+            outside_narr = [w for w in row if not (n_lo <= mid(w) <= n_hi)]
+            # Continuation lines are tightly spaced and live almost entirely in
+            # the narration column. Summary/footer blocks should not be glued to
+            # the previous transaction.
+            joined_row = " ".join(w["text"] for w in row)
+            if _FOOTER_RE.search(joined_row):
+                flush_current()
+                prev_top = row_top
+                continue
+            if gap > 25:
+                flush_current()
+                prev_top = row_top
+                continue
+            if current and narr_text and len(outside_narr) <= 1:
+                current["description"] = f"{current['description']} {narr_text}".strip()
+            prev_top = row_top
             continue
 
-        narr_text = " ".join(w["text"] for w in row if n_lo <= mid(w) <= n_hi).strip()
+        flush_current()
+
         if not narr_text:
             continue
 
-        debit  = best_amount(row, db_lo, db_hi, role_cx["debit"])
-        credit = best_amount(row, cr_lo, cr_hi, role_cx["credit"])
-
+        debit = best_amount(row, db_lo, db_hi, spec["debit_cx"])
+        credit = best_amount(row, cr_lo, cr_hi, spec["credit_cx"])
         if debit <= 0 and credit <= 0:
             continue
         if debit > 0 and credit > 0:
             continue
 
-        transactions.append({
+        current = {
             "date":        date_str,
             "description": narr_text,
             "amount":      round(debit if debit > 0 else credit, 2),
             "type":        "debit" if debit > 0 else "credit",
-        })
+        }
+        prev_top = row_top
 
-    return transactions
+    flush_current()
+    return transactions, spec
 
 
 # ── Existing table-based extraction (kept for banks that do have row lines) ─
@@ -278,6 +340,7 @@ def extract_from_table(table: list) -> list:
 def extract_transactions(content: bytes, password: Optional[str]) -> list:
     open_kwargs = {"password": password} if password else {}
     all_transactions: list = []
+    word_spec: Optional[dict] = None
 
     with pdfplumber.open(io.BytesIO(content), **open_kwargs) as pdf:
         for page in pdf.pages:
@@ -291,8 +354,9 @@ def extract_transactions(content: bytes, password: Optional[str]) -> list:
                 table_txns.extend(extract_from_table(table))
 
             # Strategy 2: word-coordinate extraction — handles HDFC-style merged rows
-            # Always run; use whichever strategy yields more transactions
-            word_txns = extract_by_words(page)
+            # Reuse previously detected column positions on later pages that do not
+            # repeat the transaction table header.
+            word_txns, word_spec = extract_by_words(page, word_spec)
             page_txns = word_txns if len(word_txns) > len(table_txns) else table_txns
 
             # Strategy 3: text-based table extraction as last resort
