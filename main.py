@@ -385,7 +385,7 @@ def extract_transactions(content: bytes, password: Optional[str]) -> list:
     word_spec: Optional[dict] = None
 
     with pdfplumber.open(io.BytesIO(content), **open_kwargs) as pdf:
-        for page in pdf.pages:
+        for page_idx, page in enumerate(pdf.pages):
             # Strategy 1: line-based table extraction
             line_tables = page.extract_tables({
                 "vertical_strategy":   "lines",
@@ -410,16 +410,19 @@ def extract_transactions(content: bytes, password: Optional[str]) -> list:
                 for table in (text_tables or []):
                     page_txns.extend(extract_from_table(table))
 
-            all_transactions.extend(page_txns)
+            # Tag each transaction with its source page before merging
+            for t in page_txns:
+                all_transactions.append({**t, "_page": page_idx})
 
-    # Deduplicate while preserving order
+    # Deduplicate using (page, content) key: removes same-row extraction artifacts
+    # while preserving legitimate identical transactions on different pages.
     seen: set = set()
     unique = []
     for t in all_transactions:
-        key = f"{t['date']}|{t['amount']}|{t['type']}|{t['description'][:40]}"
+        key = f"{t['_page']}|{t['date']}|{t['amount']}|{t['type']}|{t['description'][:40]}"
         if key not in seen:
             seen.add(key)
-            unique.append(t)
+            unique.append({k: v for k, v in t.items() if k != "_page"})
     return unique
 
 
