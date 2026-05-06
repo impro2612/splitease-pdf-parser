@@ -93,6 +93,8 @@ def _classify_header_word(text: str) -> str:
         return "date"
     if any(k in t for k in ["narration", "description", "particulars"]):
         return "narr"
+    if any(k in t for k in ["chq/ref", "chq", "refno", "ref.no", "ref no", "reference", "utr"]):
+        return "ref"
     if any(k in t for k in ["withdrawal", "debit", "dr"]):
         return "debit"
     if any(k in t for k in ["deposit", "credit", "cr"]):
@@ -127,7 +129,7 @@ def detect_word_columns(rows: list, page_w: float) -> tuple[Optional[int], dict]
         return None, {}
 
     # Fill in HDFC defaults for any role that wasn't detected
-    defaults = {"date": 60.0, "narr": 230.0, "debit": 415.0, "credit": 495.0}
+    defaults = {"date": 60.0, "narr": 230.0, "ref": 355.0, "debit": 415.0, "credit": 495.0}
     for role, default_cx in defaults.items():
         if role not in role_cx:
             role_cx[role] = default_cx
@@ -144,16 +146,19 @@ def detect_word_columns(rows: list, page_w: float) -> tuple[Optional[int], dict]
 
     d_lo,  d_hi  = bounds_for_cx(role_cx["date"])
     n_lo,  n_hi  = bounds_for_cx(role_cx["narr"])
+    r_lo,  r_hi  = bounds_for_cx(role_cx["ref"])
     db_lo, db_hi = bounds_for_cx(role_cx["debit"])
     cr_lo, cr_hi = bounds_for_cx(role_cx["credit"])
 
     return header_idx, {
         "date_cx": role_cx["date"],
         "narr_cx": role_cx["narr"],
+        "ref_cx": role_cx["ref"],
         "debit_cx": role_cx["debit"],
         "credit_cx": role_cx["credit"],
         "date_bounds": (d_lo, d_hi),
         "narr_bounds": (n_lo, n_hi),
+        "ref_bounds": (r_lo, r_hi),
         "debit_bounds": (db_lo, db_hi),
         "credit_bounds": (cr_lo, cr_hi),
     }
@@ -235,6 +240,7 @@ def extract_by_words(page, prev_spec: Optional[dict] = None) -> tuple[list, dict
 
     d_lo, d_hi = spec["date_bounds"]
     n_lo, n_hi = spec["narr_bounds"]
+    r_lo, r_hi = spec["ref_bounds"]
     db_lo, db_hi = spec["debit_bounds"]
     cr_lo, cr_hi = spec["credit_bounds"]
 
@@ -294,6 +300,7 @@ def extract_by_words(page, prev_spec: Optional[dict] = None) -> tuple[list, dict
         current = {
             "date":        date_str,
             "description": narr_text,
+            "reference":   " ".join(w["text"] for w in row if r_lo <= mid(w) <= r_hi).strip(),
             "amount":      round(debit if debit > 0 else credit, 2),
             "type":        "debit" if debit > 0 else "credit",
         }
@@ -322,6 +329,8 @@ def find_column_indices(header_row: list) -> dict:
             cols["date"] = i
         if "narration" not in cols and any(k in text for k in ["narration", "description", "particulars"]):
             cols["narration"] = i
+        if "ref" not in cols and any(k in text for k in ["chq/ref", "chq", "refno", "ref.no", "ref no", "reference", "utr"]):
+            cols["ref"] = i
         if "withdrawal" not in cols and any(k in text for k in ["withdrawal", "debit", "dr"]):
             cols["withdrawal"] = i
         if "deposit" not in cols and any(k in text for k in ["deposit", "credit", "cr"]):
@@ -347,6 +356,7 @@ def extract_from_table(table: list) -> list:
     date_col = col_idx.get("date", 0)
     narr_col = col_idx.get("narration", 1)
     wdl_col  = col_idx.get("withdrawal", 4)
+    ref_col  = col_idx.get("ref", 2)
     dep_col  = col_idx.get("deposit", 5)
 
     transactions = []
@@ -372,6 +382,7 @@ def extract_from_table(table: list) -> list:
         transactions.append({
             "date":        date_str,
             "description": narration,
+            "reference":   str(row[ref_col] if ref_col < len(row) else "").replace("\n", " ").strip(),
             "amount":      round(withdrawal if withdrawal > 0 else deposit, 2),
             "type":        "debit" if withdrawal > 0 else "credit",
         })
@@ -410,19 +421,22 @@ def extract_transactions(content: bytes, password: Optional[str]) -> list:
                 for table in (text_tables or []):
                     page_txns.extend(extract_from_table(table))
 
-            # Tag each transaction with its source page before merging
-            for t in page_txns:
-                all_transactions.append({**t, "_page": page_idx})
+            # Keep parser order stable and carry page/sequence metadata so identical
+            # legitimate transactions do not collapse into one row.
+            for seq, t in enumerate(page_txns):
+                all_transactions.append({**t, "_page": page_idx, "_seq": seq})
 
-    # Deduplicate using (page, content) key: removes same-row extraction artifacts
-    # while preserving legitimate identical transactions on different pages.
-    seen: set = set()
-    unique = []
+    seen_ref_keys: set = set()
+    unique: list = []
     for t in all_transactions:
-        key = f"{t['_page']}|{t['date']}|{t['amount']}|{t['type']}|{t['description'][:40]}"
-        if key not in seen:
-            seen.add(key)
-            unique.append({k: v for k, v in t.items() if k != "_page"})
+        ref = str(t.get("reference") or "").strip()
+        if ref:
+            key = f"{t['_page']}|{t['date']}|{t['amount']}|{t['type']}|{ref}"
+            if key in seen_ref_keys:
+                continue
+            seen_ref_keys.add(key)
+        unique.append({k: v for k, v in t.items() if k not in {"_page", "_seq"}})
+
     return unique
 
 
