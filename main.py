@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 MAX_FILE_BYTES = 15 * 1024 * 1024   # 15 MB decoded
 MAX_PAGES     = 30
-PARSE_TIMEOUT = 45                   # seconds
+PARSE_TIMEOUT = 60                   # seconds
 
 app = FastAPI(title="SplitEase PDF Parser")
 
