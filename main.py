@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import re
@@ -7,6 +8,10 @@ import pdfplumber
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+MAX_FILE_BYTES = 15 * 1024 * 1024   # 15 MB decoded
+MAX_PAGES     = 30
+PARSE_TIMEOUT = 45                   # seconds
 
 app = FastAPI(title="SplitEase PDF Parser")
 
@@ -455,9 +460,40 @@ async def parse_pdf(req: ParseRequest):
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
+    if len(content) > MAX_FILE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum allowed size is {MAX_FILE_BYTES // (1024*1024)} MB.",
+        )
+
+    # Check page count before full parse
     try:
-        transactions = extract_transactions(content, req.password)
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            page_count = len(pdf.pages)
+        if page_count > MAX_PAGES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"PDF has {page_count} pages. Maximum allowed is {MAX_PAGES} pages.",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        err = str(e).lower()
+        if any(k in err for k in ["password", "incorrect", "encrypt", "pkcs"]):
+            raise HTTPException(status_code=422, detail="needsPassword")
+        raise HTTPException(status_code=400, detail="Could not open PDF. File may be corrupted.")
+
+    try:
+        transactions = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, extract_transactions, content, req.password),
+            timeout=PARSE_TIMEOUT,
+        )
         return {"transactions": transactions}
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=408,
+            detail=f"PDF parsing timed out after {PARSE_TIMEOUT}s. Try a smaller file.",
+        )
     except Exception as e:
         err = str(e).lower()
         if any(k in err for k in ["password", "incorrect", "encrypt", "pkcs"]):
