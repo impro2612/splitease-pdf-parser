@@ -468,7 +468,7 @@ async def parse_pdf(req: ParseRequest):
 
     # Check page count before full parse
     try:
-        with pdfplumber.open(io.BytesIO(content)) as pdf:
+        with pdfplumber.open(io.BytesIO(content), password=req.password) as pdf:
             page_count = len(pdf.pages)
         if page_count > MAX_PAGES:
             raise HTTPException(
