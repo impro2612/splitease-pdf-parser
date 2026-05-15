@@ -1,31 +1,39 @@
 import asyncio
 import base64
 import io
+import logging
+import os
 import re
 from typing import Optional
 
 import pdfplumber
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 MAX_FILE_BYTES = 15 * 1024 * 1024   # 15 MB decoded
 MAX_PAGES     = 30
 PARSE_TIMEOUT = 60                   # seconds
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+_ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://splitease.vercel.app")
+
 app = FastAPI(title="SplitEase PDF Parser")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[_ALLOWED_ORIGIN],
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
 
 class ParseRequest(BaseModel):
-    pdf_base64: str
-    password: Optional[str] = None
+    # ~10 MB base64 ≈ 7.5 MB decoded PDF — prevents memory exhaustion on Render's free tier
+    pdf_base64: str = Field(..., max_length=10_000_000)
+    password: Optional[str] = Field(None, max_length=512)
 
 
 # Matches Indian bank amounts: digits with optional commas and one decimal part
@@ -63,7 +71,12 @@ def parse_date(text: str) -> str:
     if not m:
         return ""
     d, mo, y = m.group(1), m.group(2), m.group(3)
-    year = f"20{y}" if len(y) == 2 else y
+    if len(y) == 2:
+        # POSIX pivot: 00-68 → 2000s, 69-99 → 1900s (same rule as strptime %y)
+        pivot = int(y)
+        year = str(2000 + pivot) if pivot <= 68 else str(1900 + pivot)
+    else:
+        year = y
     try:
         from datetime import datetime
         datetime(int(year), int(mo), int(d))
@@ -452,12 +465,15 @@ async def health():
 
 @app.post("/parse-pdf")
 async def parse_pdf(req: ParseRequest):
+    logger.info("parse_pdf: received request, payload_len=%d", len(req.pdf_base64))
     try:
         content = base64.b64decode(req.pdf_base64)
     except Exception:
+        logger.warning("parse_pdf: invalid base64 data")
         raise HTTPException(status_code=400, detail="Invalid base64 data")
 
     if not content:
+        logger.warning("parse_pdf: empty file after decode")
         raise HTTPException(status_code=400, detail="Empty file")
 
     if len(content) > MAX_FILE_BYTES:
@@ -481,6 +497,7 @@ async def parse_pdf(req: ParseRequest):
         err = str(e).lower()
         if any(k in err for k in ["password", "incorrect", "encrypt", "pkcs"]):
             raise HTTPException(status_code=422, detail="needsPassword")
+        logger.error("parse_pdf: failed to open PDF", exc_info=True)
         raise HTTPException(status_code=400, detail="Could not open PDF. File may be corrupted.")
 
     try:
@@ -488,8 +505,10 @@ async def parse_pdf(req: ParseRequest):
             asyncio.get_event_loop().run_in_executor(None, extract_transactions, content, req.password),
             timeout=PARSE_TIMEOUT,
         )
+        logger.info("parse_pdf: extracted %d transactions", len(transactions))
         return {"transactions": transactions}
     except asyncio.TimeoutError:
+        logger.warning("parse_pdf: timed out after %ds", PARSE_TIMEOUT)
         raise HTTPException(
             status_code=408,
             detail=f"PDF parsing timed out after {PARSE_TIMEOUT}s. Try a smaller file.",
@@ -500,4 +519,5 @@ async def parse_pdf(req: ParseRequest):
             if req.password:
                 raise HTTPException(status_code=400, detail="Incorrect password. Please try again.")
             raise HTTPException(status_code=422, detail="needsPassword")
-        raise HTTPException(status_code=500, detail=f"PDF parsing failed: {str(e)[:300]}")
+        logger.error("parse_pdf: extraction failed", exc_info=True)
+        raise HTTPException(status_code=500, detail="PDF parsing failed. Please try a different file.")
