@@ -26,7 +26,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[_ALLOWED_ORIGIN],
     allow_methods=["POST", "GET"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -449,8 +449,13 @@ def extract_transactions(content: bytes, password: Optional[str]) -> list:
     for t in all_transactions:
         ref = str(t.get("reference") or "").strip()
         if ref:
-            key = f"{t['_page']}|{t['date']}|{t['amount']}|{t['type']}|{ref}"
+            # Use narration prefix instead of page number so legitimate same-page
+            # repeated transactions (e.g. reversal + re-posting) are preserved,
+            # while exact parser duplicates (same ref/date/amount/type/narration) are dropped.
+            narration_prefix = str(t.get("narration") or "")[:40]
+            key = f"{t['date']}|{t['amount']}|{t['type']}|{ref}|{narration_prefix}"
             if key in seen_ref_keys:
+                logger.warning("dedup: dropped duplicate transaction ref=%s date=%s", ref, t['date'])
                 continue
             seen_ref_keys.add(key)
         unique.append({k: v for k, v in t.items() if k not in {"_page", "_seq"}})
