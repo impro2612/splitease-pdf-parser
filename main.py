@@ -7,7 +7,7 @@ import re
 from typing import Optional
 
 import pdfplumber
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -18,7 +18,8 @@ PARSE_TIMEOUT = 60                   # seconds
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-_ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://splitease.vercel.app")
+_ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://splitwithease.vercel.app")
+_INTERNAL_SECRET = os.environ.get("PDF_PARSER_SECRET", "")
 
 app = FastAPI(title="SplitEase PDF Parser")
 
@@ -469,7 +470,9 @@ async def health():
 
 
 @app.post("/parse-pdf")
-async def parse_pdf(req: ParseRequest):
+async def parse_pdf(req: ParseRequest, x_internal_secret: str = Header(default="")):
+    if _INTERNAL_SECRET and x_internal_secret != _INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
     logger.info("parse_pdf: received request, payload_len=%d", len(req.pdf_base64))
     try:
         content = base64.b64decode(req.pdf_base64)

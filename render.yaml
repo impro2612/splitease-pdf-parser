@@ -8,4 +8,6 @@ services:
       - key: PYTHON_VERSION
         value: 3.12.9
       - key: ALLOWED_ORIGIN
-        value: https://splitease.vercel.app
+        value: https://splitwithease.vercel.app
+      - key: PDF_PARSER_SECRET
+        sync: false
